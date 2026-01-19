@@ -46,6 +46,7 @@ venv.bak/
 # Project specific
 screenshots/
 PROMPTS.md
+chat_history.json
 
 # Jupyter Notebook
 .ipynb_checkpoints

@@ -6,10 +6,12 @@ CLI приложение для работы с нейросетями чере�
 
 import os
 import sys
+import json
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import openai
 import anthropic
+from datetime import datetime
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -27,14 +29,20 @@ SYSTEM_PROMPT = "Ты полезный ассистент. Веди диалог
 class ChatSession:
     """Класс для управления сессией чата с сохранением контекста"""
     
-    def __init__(self, use_web_search: bool = False):
+    HISTORY_FILE = "chat_history.json"
+    
+    def __init__(self, use_web_search: bool = False, mode: str = "openai"):
         self.messages: List[Dict[str, Any]] = []
         self.use_web_search = use_web_search
-        # Добавляем системный промпт
-        self.messages.append({
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        })
+        self.mode = mode  # "openai" или "anthropic"
+        # Загружаем историю из файла
+        self.load_history()
+        # Если истории нет, добавляем системный промпт
+        if not self.messages or self.messages[0].get("role") != "system":
+            self.messages.insert(0, {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            })
     
     def add_user_message(self, content: str):
         """Добавляет сообщение пользователя в историю"""
@@ -63,6 +71,47 @@ class ChatSession:
         if self.messages and self.messages[0]["role"] == "system":
             return self.messages[0]["content"]
         return SYSTEM_PROMPT
+    
+    def save_history(self):
+        """Сохраняет историю диалога в файл"""
+        try:
+            history_data = {
+                "mode": self.mode,
+                "use_web_search": self.use_web_search,
+                "last_updated": datetime.now().isoformat(),
+                "messages": self.messages
+            }
+            with open(self.HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[Предупреждение: Не удалось сохранить историю: {e}]\n")
+    
+    def load_history(self):
+        """Загружает историю диалога из файла"""
+        try:
+            if os.path.exists(self.HISTORY_FILE):
+                with open(self.HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    history_data = json.load(f)
+                    # Загружаем только если режим совпадает
+                    if history_data.get("mode") == self.mode:
+                        self.messages = history_data.get("messages", [])
+                        if self.messages:
+                            print(f"[Загружена история диалога из предыдущей сессии]\n")
+        except Exception as e:
+            print(f"[Предупреждение: Не удалось загрузить историю: {e}]\n")
+            self.messages = []
+    
+    def clear_history(self):
+        """Очищает историю диалога"""
+        self.messages = [{
+            "role": "system",
+            "content": SYSTEM_PROMPT
+        }]
+        if os.path.exists(self.HISTORY_FILE):
+            try:
+                os.remove(self.HISTORY_FILE)
+            except:
+                pass
 
 
 def get_api_key() -> str:
@@ -84,10 +133,11 @@ def chat_without_reasoning(api_key: str, use_web_search: bool):
     
     client = openai.OpenAI(
         api_key=api_key,
-        base_url=OPENAI_BASE_URL
+        base_url=OPENAI_BASE_URL,
+        timeout=30.0  # Таймаут 30 секунд
     )
     
-    session = ChatSession(use_web_search=use_web_search)
+    session = ChatSession(use_web_search=use_web_search, mode="openai")
     
     while True:
         try:
@@ -176,12 +226,24 @@ def chat_without_reasoning(api_key: str, use_web_search: bool):
             # Сохраняем ответ в историю
             if assistant_message:
                 session.add_assistant_message(assistant_message)
+                session.save_history()  # Сохраняем историю после каждого ответа
             
         except KeyboardInterrupt:
             print("\n\nВыход из чата...\n")
+            session.save_history()  # Сохраняем историю при выходе
             break
+        except openai.APITimeoutError as e:
+            print(f"\n[Ошибка: Превышено время ожидания ответа от API (таймаут)]\n")
+            print(f"Детали: {e}\n")
+            continue
+        except openai.APIError as e:
+            print(f"\n[Ошибка API: {e.status_code if hasattr(e, 'status_code') else 'Unknown'}]\n")
+            print(f"Детали: {e}\n")
+            continue
         except Exception as e:
-            print(f"\nОшибка: {e}\n")
+            print(f"\n[Ошибка: {e}]\n")
+            import traceback
+            traceback.print_exc()
             continue
 
 
@@ -194,10 +256,11 @@ def chat_with_reasoning(api_key: str, use_web_search: bool):
     
     client = anthropic.Anthropic(
         api_key=api_key,
-        base_url=ANTHROPIC_BASE_URL
+        base_url=ANTHROPIC_BASE_URL,
+        timeout=30.0  # Таймаут 30 секунд
     )
     
-    session = ChatSession(use_web_search=use_web_search)
+    session = ChatSession(use_web_search=use_web_search, mode="anthropic")
     
     while True:
         try:
@@ -339,9 +402,6 @@ def chat_with_reasoning(api_key: str, use_web_search: bool):
                 for reasoning in reasoning_blocks:
                     print(reasoning)
                 print()
-            else:
-                # Если рассуждений нет, выводим отладочную информацию
-                print(f"\n[Отладка: Рассуждения не найдены. Типы блоков в ответе: {[getattr(b, 'type', 'unknown') for b in response.content]}]\n")
             
             # Выводим финальный ответ
             final_answer = ""
@@ -362,12 +422,22 @@ def chat_with_reasoning(api_key: str, use_web_search: bool):
             # Для Anthropic нужно сохранить весь ответ
             if final_answer:
                 session.add_assistant_message(final_answer)
+                session.save_history()  # Сохраняем историю после каждого ответа
             
         except KeyboardInterrupt:
             print("\n\nВыход из чата...\n")
+            session.save_history()  # Сохраняем историю при выходе
             break
+        except anthropic.APITimeoutError as e:
+            print(f"\n[Ошибка: Превышено время ожидания ответа от API (таймаут)]\n")
+            print(f"Детали: {e}\n")
+            continue
+        except anthropic.APIError as e:
+            print(f"\n[Ошибка API: {e.status_code if hasattr(e, 'status_code') else 'Unknown'}]\n")
+            print(f"Детали: {e}\n")
+            continue
         except Exception as e:
-            print(f"\nОшибка: {e}\n")
+            print(f"\n[Ошибка: {e}\n")
             import traceback
             traceback.print_exc()
             continue
@@ -398,7 +468,21 @@ def show_menu():
 
 def main():
     """Главная функция приложения"""
-    api_key = get_api_key()
+    print("\n" + "="*70)
+    print("CLI Text AI Agent - Консольный ассистент для работы с нейросетями")
+    print("="*70)
+    print(f"Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*70)
+    
+    try:
+        api_key = get_api_key()
+        print("[✓] API ключ загружен успешно")
+    except SystemExit:
+        print("[✗] Не удалось загрузить API ключ. Завершение работы.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[✗] Ошибка при загрузке API ключа: {e}")
+        sys.exit(1)
     
     while True:
         try:
@@ -409,10 +493,20 @@ def main():
                 print("\nДо свидания!")
                 break
             elif choice == "1":
+                print("\n[Режим: OpenAI GPT-4o mini]")
                 use_web_search = ask_web_search()
+                if use_web_search:
+                    print("[Веб-поиск: включен]")
+                else:
+                    print("[Веб-поиск: выключен]")
                 chat_without_reasoning(api_key, use_web_search)
             elif choice == "2":
+                print("\n[Режим: Anthropic Claude Sonnet 4.5 с рассуждениями]")
                 use_web_search = ask_web_search()
+                if use_web_search:
+                    print("[Веб-поиск: включен]")
+                else:
+                    print("[Веб-поиск: выключен]")
                 chat_with_reasoning(api_key, use_web_search)
             else:
                 print("\nНеверный выбор. Пожалуйста, выберите 0, 1 или 2.\n")
